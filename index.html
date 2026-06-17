@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Star Guardian – Reaction Survival</title>
+  <meta name="description" content="A fast-paced reaction-based survival arcade game. Protect the wandering star by clicking enemies to destroy them with your attack square.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;800;900&family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    html,body{width:100%;height:100%;overflow:hidden;background:#04040c;font-family:'Inter',system-ui,sans-serif;cursor:crosshair;user-select:none;-webkit-user-select:none;-webkit-tap-highlight-color:transparent;touch-action:none}
+    canvas{display:block}
+  </style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  const C = document.getElementById('c');
+  const X = C.getContext('2d');
+
+  /* ── constants ── */
+  const STAR_R       = 15;
+  const SQ_HALF      = 11;
+  const E_R_MIN      = 9;
+  const E_R_MAX      = 14;
+  const DASH_SPEED   = 3800;          // px / s
+  const SAFE_DIST    = 200;           // min spawn distance from star
+  const CLICK_TOL    = 14;            // extra px around enemy for click
+  const DIFF_SEC     = 12;            // seconds per difficulty tick
+
+  /* ── state ── */
+  let W, H, arena;
+  let phase = 'title';               // title | play | over | pause
+  let time = 0, best = +(localStorage.getItem('sg_best') || 0);
+  let diff = 0, diffAcc = 0, spawnAcc = 0;
+  let star, sq;
+  let enemies  = [];
+  let particles = [];
+  let flashes   = [];
+  let starCubes = [];                 // star trail cube particles
+  let shakeX = 0, shakeY = 0;
+  let prevTS = 0;
+  let gameOverFlash = 0;
+  let titlePulse = 0;
+  let showHelp = false;               // instruction popup open?
+
+  /* ── pause menu button rects (computed in drawPause) ── */
+  let pauseBtns = { resume: null, restart: null, quit: null };
+
+  /* ── clickable rect storage ── */
+  let helpBtn      = null;            // "How to Play" button rect
+  let helpCloseBtn = null;            // close button inside popup
+
+  /* ── pause icon hit-box (top-right corner) ── */
+  const PAUSE_BTN_SIZE = 38;
+  const PAUSE_BTN_PAD  = 14;
+
+  /* ── helpers ── */
+  const rng   = (a, b) => a + Math.random() * (b - a);
+  const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+  const dist2 = (a, b) => { const dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; };
+  const dist  = (a, b) => Math.sqrt(dist2(a, b));
+  const angDiff = (a, b) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return d; };
+
+  function fmt(t) {
+    const m  = Math.floor(t / 60);
+    const s  = Math.floor(t % 60);
+    const ms = Math.floor((t % 1) * 100);
+    return `${m}:${String(s).padStart(2, '0')}.${String(ms).padStart(2, '0')}`;
+  }
+
+  /* ── resize ── */
+  function resize() {
+    W = C.width  = window.innerWidth;
+    H = C.height = window.innerHeight;
+    const pad = Math.max(30, Math.min(50, Math.min(W, H) * 0.035));
+    arena = { x: pad, y: pad, w: W - pad * 2, h: H - pad * 2 };
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  /* ================================================================
+     STAR
+     ================================================================ */
+  function makeStar() {
+    return {
+      x: arena.x + arena.w / 2 + rng(-80, 80),
+      y: arena.y + arena.h / 2 + rng(-60, 60),
+      ang: Math.random() * Math.PI * 2,
+      tAng: Math.random() * Math.PI * 2,
+      spd: 78,
+      dirT: rng(6, 8),
+      r: STAR_R,
+      rot: 0,
+      glow: 0,
+      cubeTimer: 0          // cube spawn accumulator
+    };
+  }
+
+  function updateStar(dt) {
+    star.rot  += dt * 0.6;
+    star.glow += dt * 3.8;
+
+    /* erratic factor grows with difficulty */
+    const erratic = 1 + diff * 0.13;
+
+    /* periodic direction change */
+    star.dirT -= dt;
+    if (star.dirT <= 0) {
+      star.tAng = star.ang + rng(-Math.PI, Math.PI) * Math.min(erratic, 3.2);
+      star.dirT = rng(6, 8) / erratic;
+    }
+
+    /* smooth steering */
+    const turn = 1.3 + diff * 0.12;
+    star.ang += angDiff(star.ang, star.tAng) * Math.min(dt * turn, 0.75);
+
+    const spd = star.spd * (1 + diff * 0.022);
+    let vx = Math.cos(star.ang) * spd;
+    let vy = Math.sin(star.ang) * spd;
+
+    /* edge avoidance – quadratic push */
+    const buf = 130;
+    const force = spd * 3.5;
+    const l = star.x - arena.x, r = arena.x + arena.w - star.x;
+    const t = star.y - arena.y, b = arena.y + arena.h - star.y;
+    if (l < buf) vx += ((buf - l) / buf) ** 2 * force;
+    if (r < buf) vx -= ((buf - r) / buf) ** 2 * force;
+    if (t < buf) vy += ((buf - t) / buf) ** 2 * force;
+    if (b < buf) vy -= ((buf - b) / buf) ** 2 * force;
+
+    star.x += vx * dt;
+    star.y += vy * dt;
+    star.x = clamp(star.x, arena.x + star.r + 2, arena.x + arena.w - star.r - 2);
+    star.y = clamp(star.y, arena.y + star.r + 2, arena.y + arena.h - star.r - 2);
+
+    /* cube particle trail */
+    star.cubeTimer += dt;
+    const cubeInterval = 0.035;       // spawn rate
+    while (star.cubeTimer >= cubeInterval) {
+      star.cubeTimer -= cubeInterval;
+      starCubes.push({
+        x: star.x + rng(-5, 5),
+        y: star.y + rng(-5, 5),
+        vx: rng(-18, 18),
+        vy: rng(-18, 18),
+        a: rng(0.55, 0.8),
+        sz: rng(2, 4.5),
+        rot: rng(0, Math.PI * 2),
+        rv: rng(-6, 6)             // rotation velocity
+      });
+    }
+  }
+
+  /* update star cube trail */
+  function updateStarCubes(dt) {
+    for (let i = starCubes.length - 1; i >= 0; i--) {
+      const c = starCubes[i];
+      c.x   += c.vx * dt;
+      c.y   += c.vy * dt;
+      c.rot += c.rv * dt;
+      c.a   -= dt * 2.4;
+      c.sz  *= (1 - dt * 1.2);     // shrink
+      if (c.a <= 0 || c.sz < 0.3) starCubes.splice(i, 1);
+    }
+  }
+
+  /* ================================================================
+     ENEMIES
+     ================================================================ */
+  function spawnEnemy() {
+    const eth = 190;
+    const sides = [];
+    if (star.x - arena.x            > eth) sides.push('l');
+    if (arena.x + arena.w - star.x  > eth) sides.push('r');
+    if (star.y - arena.y            > eth) sides.push('t');
+    if (arena.y + arena.h - star.y  > eth) sides.push('b');
+    if (!sides.length) sides.push('l', 'r', 't', 'b');
+
+    const s = sides[Math.floor(Math.random() * sides.length)];
+    let ex, ey;
+    const off = 28;
+    switch (s) {
+      case 'l': ex = arena.x - off;            ey = arena.y + rng(0, arena.h); break;
+      case 'r': ex = arena.x + arena.w + off;  ey = arena.y + rng(0, arena.h); break;
+      case 't': ex = arena.x + rng(0, arena.w); ey = arena.y - off;            break;
+      case 'b': ex = arena.x + rng(0, arena.w); ey = arena.y + arena.h + off;  break;
+    }
+
+    if (dist({ x: ex, y: ey }, star) < SAFE_DIST) return;
+
+    const r = rng(E_R_MIN, E_R_MAX);
+    const spd = (58 + diff * 11) + rng(-8, 14);
+    enemies.push({ x: ex, y: ey, r, spd, targeted: false, id: Math.random() });
+  }
+
+  function updateEnemies(dt) {
+    for (let i = 0; i < enemies.length; i++) {
+      const e = enemies[i];
+
+      /* pursue star */
+      const dx = star.x - e.x, dy = star.y - e.y;
+      const d  = Math.sqrt(dx * dx + dy * dy);
+      if (d > 0.5) {
+        e.x += (dx / d) * e.spd * dt;
+        e.y += (dy / d) * e.spd * dt;
+      }
+
+      /* collision with star → game over */
+      if (dist(e, star) < e.r + star.r) { endGame(); return; }
+
+      /* bounce off siblings */
+      for (let j = i + 1; j < enemies.length; j++) {
+        const o = enemies[j];
+        const bx = o.x - e.x, by = o.y - e.y;
+        const bd = Math.sqrt(bx * bx + by * by);
+        const minD = e.r + o.r;
+        if (bd < minD && bd > 0.1) {
+          const push = (minD - bd) * 0.52;
+          const nx = bx / bd, ny = by / bd;
+          e.x -= nx * push;  e.y -= ny * push;
+          o.x += nx * push;  o.y += ny * push;
+        }
+      }
+    }
+  }
+
+  /* ================================================================
+     SQUARE (player attack agent)
+     ================================================================ */
+  function makeSquare() {
+    return {
+      x: arena.x + rng(120, arena.w - 120),
+      y: arena.y + rng(100, arena.h - 100),
+      vx: 0, vy: 0,
+      st: 'idle',          // idle | dash | pass | drift
+      tgt: null,
+      ldx: 0, ldy: 0,     // locked direction
+      passDist: 0,
+      passNeed: 0,
+      driftT: 0,
+      rot: 0,
+      trail: []
+    };
+  }
+
+  function updateSquare(dt) {
+    sq.rot += dt * (sq.st === 'dash' || sq.st === 'pass' ? 18 : 2.2);
+
+    /* trail */
+    if (sq.st === 'dash' || sq.st === 'pass') {
+      sq.trail.push({ x: sq.x, y: sq.y, a: 1.0 });
+    }
+    for (let i = sq.trail.length - 1; i >= 0; i--) {
+      sq.trail[i].a -= dt * 7;
+      if (sq.trail[i].a <= 0) sq.trail.splice(i, 1);
+    }
+
+    switch (sq.st) {
+
+      /* ── idle ── */
+      case 'idle': {
+        const dec = Math.pow(0.91, dt * 60);
+        sq.vx *= dec; sq.vy *= dec;
+        sq.x += sq.vx * dt;
+        sq.y += sq.vy * dt;
+        clampSq();
+        break;
+      }
+
+      /* ── dashing toward target ── */
+      case 'dash': {
+        if (!sq.tgt || !enemies.includes(sq.tgt)) {
+          sq.st = 'idle'; sq.tgt = null; sq.vx = sq.vy = 0; break;
+        }
+        const dx = sq.tgt.x - sq.x, dy = sq.tgt.y - sq.y;
+        const d  = Math.sqrt(dx * dx + dy * dy);
+        if (d > 0.5) {
+          const nx = dx / d, ny = dy / d;
+          sq.x += nx * DASH_SPEED * dt;
+          sq.y += ny * DASH_SPEED * dt;
+
+          /* reached target? */
+          if (dist(sq, sq.tgt) < sq.tgt.r + SQ_HALF) {
+            sq.ldx = nx; sq.ldy = ny;
+            sq.st = 'pass';
+            sq.passDist = 0;
+            sq.passNeed = sq.tgt.r * 2 + SQ_HALF + 18;
+          }
+        }
+        break;
+      }
+
+      /* ── passing through target ── */
+      case 'pass': {
+        const move = DASH_SPEED * dt;
+        sq.x += sq.ldx * move;
+        sq.y += sq.ldy * move;
+        sq.passDist += move;
+        sq.trail.push({ x: sq.x, y: sq.y, a: 1.0 });
+
+        if (sq.passDist >= sq.passNeed) {
+          if (sq.tgt) killEnemy(sq.tgt);
+          sq.tgt = null;
+          sq.st = 'drift';
+          sq.vx = sq.ldx * 220;
+          sq.vy = sq.ldy * 220;
+          sq.driftT = 0.32;
+        }
+        break;
+      }
+
+      /* ── post-attack drift ── */
+      case 'drift': {
+        sq.driftT -= dt;
+        const dec = Math.pow(0.87, dt * 60);
+        sq.vx *= dec; sq.vy *= dec;
+        sq.x += sq.vx * dt;
+        sq.y += sq.vy * dt;
+        clampSq();
+        if (sq.driftT <= 0) sq.st = 'idle';
+        break;
+      }
+    }
+  }
+
+  function clampSq() {
+    sq.x = clamp(sq.x, arena.x + SQ_HALF, arena.x + arena.w - SQ_HALF);
+    sq.y = clamp(sq.y, arena.y + SQ_HALF, arena.y + arena.h - SQ_HALF);
+  }
+
+  /* ── destroy enemy ── */
+  function killEnemy(e) {
+    const idx = enemies.indexOf(e);
+    if (idx === -1) return;
+
+    /* burst particles */
+    const n = 16;
+    for (let i = 0; i < n; i++) {
+      const a = (Math.PI * 2 / n) * i + rng(-0.35, 0.35);
+      const sp = rng(140, 380);
+      particles.push({
+        x: e.x, y: e.y,
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        a: 1, r: rng(2, 5.5), hue: rng(350, 380) % 360
+      });
+    }
+
+    /* brief white flash at kill point */
+    flashes.push({ x: e.x, y: e.y, a: 1, r: e.r * 2.5 });
+
+    /* screen shake */
+    shakeX = rng(-5, 5);
+    shakeY = rng(-5, 5);
+
+    enemies.splice(idx, 1);
+  }
+
+  /* ── particles & flashes ── */
+  function updateFX(dt) {
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt;  p.y += p.vy * dt;
+      p.vx *= 0.965;      p.vy *= 0.965;
+      p.a -= dt * 2.8;
+      if (p.a <= 0) particles.splice(i, 1);
+    }
+    for (let i = flashes.length - 1; i >= 0; i--) {
+      flashes[i].a -= dt * 6;
+      flashes[i].r += dt * 120;
+      if (flashes[i].a <= 0) flashes.splice(i, 1);
+    }
+    shakeX *= 0.82; shakeY *= 0.82;
+  }
+
+  /* ── game over ── */
+  function endGame() {
+    phase = 'over';
+    gameOverFlash = 1;
+    if (time > best) { best = time; localStorage.setItem('sg_best', best.toFixed(3)); }
+  }
+
+  /* ================================================================
+     INPUT
+     ================================================================ */
+  function hitRect(r, cx, cy) {
+    return r && cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h;
+  }
+
+  function togglePause() {
+    if (phase === 'play')  { phase = 'pause'; return; }
+    if (phase === 'pause') { phase = 'play';  return; }
+  }
+
+  function click(cx, cy) {
+    /* ── help popup intercepts everything ── */
+    if (showHelp) {
+      if (hitRect(helpCloseBtn, cx, cy)) { showHelp = false; }
+      return;                            // swallow all clicks while popup open
+    }
+
+    if (phase === 'title') {
+      if (hitRect(helpBtn, cx, cy)) { showHelp = true; return; }
+      init(); return;
+    }
+    if (phase === 'over') {
+      if (hitRect(helpBtn, cx, cy)) { showHelp = true; return; }
+      init(); return;
+    }
+
+    /* ── pause overlay buttons ── */
+    if (phase === 'pause') {
+      if (hitRect(pauseBtns.resume,  cx, cy)) { phase = 'play';  return; }
+      if (hitRect(pauseBtns.restart, cx, cy)) { init();          return; }
+      if (hitRect(pauseBtns.quit,    cx, cy)) { phase = 'title'; return; }
+      return;
+    }
+
+    if (phase === 'play') {
+      /* pause icon hit area (top-right) */
+      const pbx = W - PAUSE_BTN_PAD - PAUSE_BTN_SIZE;
+      const pby = PAUSE_BTN_PAD;
+      if (cx >= pbx && cx <= pbx + PAUSE_BTN_SIZE && cy >= pby && cy <= pby + PAUSE_BTN_SIZE) {
+        togglePause();
+        return;
+      }
+
+      if (sq.st !== 'idle') return;          // busy – ignore
+
+      let bestE = null, bestD = Infinity;
+      for (const e of enemies) {
+        if (e.targeted) continue;
+        const d = dist({ x: cx, y: cy }, e);
+        if (d < e.r + CLICK_TOL && d < bestD) { bestD = d; bestE = e; }
+      }
+      if (!bestE) return;                    // empty space – ignore
+
+      bestE.targeted = true;
+      sq.tgt = bestE;
+      sq.st  = 'dash';
+
+      const dx = bestE.x - sq.x, dy = bestE.y - sq.y;
+      const d  = Math.sqrt(dx * dx + dy * dy);
+      if (d > 0) { sq.ldx = dx / d; sq.ldy = dy / d; }
+    }
+  }
+
+  C.addEventListener('pointerdown', e => { e.preventDefault(); click(e.clientX, e.clientY); });
+
+  /* Escape key toggles pause */
+  window.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.preventDefault(); togglePause(); }
+  });
+
+  /* ================================================================
+     INIT / UPDATE
+     ================================================================ */
+  function init() {
+    time = 0; diff = 0; diffAcc = 0; spawnAcc = 2.2;
+    enemies = []; particles = []; flashes = []; starCubes = [];
+    shakeX = shakeY = 0; gameOverFlash = 0;
+    showHelp = false;
+    star = makeStar();
+    sq   = makeSquare();
+    phase = 'play';
+  }
+
+  function update(dt) {
+    if (phase !== 'play') return;         // paused / title / over → freeze
+
+    time    += dt;
+    diffAcc += dt;
+    if (diffAcc >= DIFF_SEC) { diffAcc -= DIFF_SEC; diff++; }
+
+    updateStar(dt);
+
+    /* spawning */
+    const baseInt = 2.7;
+    const interval = Math.max(0.38, baseInt - diff * 0.17);
+    spawnAcc -= dt;
+    if (spawnAcc <= 0) {
+      spawnAcc = interval;
+      let n = 1;
+      if (diff >= 3  && Math.random() < 0.28) n = 2;
+      if (diff >= 5  && Math.random() < 0.22) n = 3;
+      if (diff >= 8  && Math.random() < 0.16) n = 4;
+      if (diff >= 12 && Math.random() < 0.12) n = 5;
+      for (let i = 0; i < n; i++) spawnEnemy();
+    }
+
+    updateEnemies(dt);
+    if (phase !== 'play') return;
+    updateSquare(dt);
+    updateStarCubes(dt);
+    updateFX(dt);
+  }
+
+  /* ================================================================
+     RENDERING
+     ================================================================ */
+
+  /* ── arena ── */
+  function drawArena() {
+    /* subtle fill */
+    X.fillStyle = 'rgba(6, 7, 20, 0.96)';
+    X.fillRect(arena.x, arena.y, arena.w, arena.h);
+
+    /* grid */
+    X.strokeStyle = 'rgba(55, 70, 160, 0.04)';
+    X.lineWidth = 1;
+    const g = 55;
+    for (let x = arena.x; x <= arena.x + arena.w; x += g) {
+      X.beginPath(); X.moveTo(x, arena.y); X.lineTo(x, arena.y + arena.h); X.stroke();
+    }
+    for (let y = arena.y; y <= arena.y + arena.h; y += g) {
+      X.beginPath(); X.moveTo(arena.x, y); X.lineTo(arena.x + arena.w, y); X.stroke();
+    }
+
+    /* border glow */
+    X.save();
+    X.shadowColor = 'rgba(70, 110, 240, 0.45)';
+    X.shadowBlur  = 22;
+    X.strokeStyle = 'rgba(70, 110, 240, 0.32)';
+    X.lineWidth   = 1.5;
+    X.strokeRect(arena.x, arena.y, arena.w, arena.h);
+    X.restore();
+
+    X.strokeStyle = 'rgba(90, 130, 255, 0.12)';
+    X.lineWidth   = 1;
+    X.strokeRect(arena.x - 1, arena.y - 1, arena.w + 2, arena.h + 2);
+  }
+
+  /* ── star shape helper ── */
+  function starPath(cx, cy, oR, iR, rot) {
+    X.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const r = i & 1 ? iR : oR;
+      const a = rot + i * Math.PI / 5 - Math.PI / 2;
+      i === 0 ? X.moveTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r)
+              : X.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+    }
+    X.closePath();
+  }
+
+  /* ── draw star ── */
+  function drawStar() {
+    /* cube particle trail */
+    for (const c of starCubes) {
+      if (c.a <= 0) continue;
+      X.save();
+      X.globalAlpha = clamp(c.a, 0, 0.7);
+      X.translate(c.x, c.y);
+      X.rotate(c.rot);
+      const hs = c.sz / 2;
+      X.shadowColor = 'rgba(255,210,50,0.45)';
+      X.shadowBlur  = 4;
+      X.fillStyle   = `rgba(255,215,64,${0.6 + c.a * 0.4})`;
+      X.fillRect(-hs, -hs, c.sz, c.sz);
+      X.restore();
+    }
+
+    const pulse = 1 + Math.sin(star.glow) * 0.09;
+    const oR = star.r * pulse, iR = oR * 0.42;
+
+    X.save();
+
+    /* outer glow */
+    X.shadowColor = 'rgba(255, 215, 64, 0.72)';
+    X.shadowBlur  = 28;
+    X.fillStyle   = '#ffd740';
+    starPath(star.x, star.y, oR, iR, star.rot);
+    X.fill();
+
+    /* bright core */
+    X.shadowBlur = 0;
+    X.fillStyle  = 'rgba(255, 248, 210, 0.55)';
+    starPath(star.x, star.y, oR * 0.55, iR * 0.55, star.rot);
+    X.fill();
+
+    X.restore();
+  }
+
+  /* ── draw enemies ── */
+  function drawEnemies() {
+    for (const e of enemies) {
+      const d = dist(e, star);
+      const danger = clamp(1 - d / 320, 0, 1);
+
+      X.save();
+
+      /* glow intensifies with proximity */
+      const gAlpha = 0.35 + danger * 0.45;
+      X.shadowColor = e.targeted
+        ? `rgba(255,90,90,${gAlpha + 0.2})`
+        : `rgba(220,40,50,${gAlpha})`;
+      X.shadowBlur = 10 + danger * 14;
+
+      const light = 42 + danger * 16;
+      X.fillStyle = e.targeted
+        ? `hsl(356, 82%, ${light + 12}%)`
+        : `hsl(356, 72%, ${light}%)`;
+
+      X.beginPath();
+      X.arc(e.x, e.y, e.r, 0, Math.PI * 2);
+      X.fill();
+
+      /* specular highlight */
+      X.shadowBlur = 0;
+      X.fillStyle  = `rgba(255,255,255,${0.07 + danger * 0.09})`;
+      X.beginPath();
+      X.arc(e.x - e.r * 0.28, e.y - e.r * 0.28, e.r * 0.32, 0, Math.PI * 2);
+      X.fill();
+
+      X.restore();
+    }
+  }
+
+  /* ── draw square trail ── */
+  function drawTrail() {
+    for (const t of sq.trail) {
+      X.save();
+      X.globalAlpha = t.a * 0.38;
+      X.translate(t.x, t.y);
+      X.rotate(sq.rot * 0.7);
+      const s = SQ_HALF * clamp(t.a, 0.3, 1);
+      X.fillStyle = '#00d4ff';
+      X.fillRect(-s, -s, s * 2, s * 2);
+      X.restore();
+    }
+  }
+
+  /* ── draw square ── */
+  function drawSquare() {
+    X.save();
+    X.translate(sq.x, sq.y);
+    X.rotate(sq.rot);
+
+    const attacking = sq.st === 'dash' || sq.st === 'pass';
+    X.shadowColor = attacking ? 'rgba(0,220,255,0.92)' : 'rgba(0,170,255,0.45)';
+    X.shadowBlur  = attacking ? 20 : 10;
+    X.fillStyle   = '#00d4ff';
+    X.fillRect(-SQ_HALF, -SQ_HALF, SQ_HALF * 2, SQ_HALF * 2);
+
+    X.shadowBlur = 0;
+    X.fillStyle  = 'rgba(200,245,255,0.32)';
+    const inner = SQ_HALF * 0.45;
+    X.fillRect(-inner, -inner, inner * 2, inner * 2);
+
+    X.restore();
+  }
+
+  /* ── particles & flashes ── */
+  function drawFX() {
+    for (const p of particles) {
+      X.save();
+      X.globalAlpha = clamp(p.a, 0, 1);
+      X.fillStyle   = `hsl(${p.hue}, 82%, 58%)`;
+      X.shadowColor = `hsla(${p.hue}, 90%, 55%, 0.55)`;
+      X.shadowBlur  = 6;
+      X.beginPath();
+      X.arc(p.x, p.y, Math.max(0.5, p.r * p.a), 0, Math.PI * 2);
+      X.fill();
+      X.restore();
+    }
+    for (const f of flashes) {
+      X.save();
+      X.globalAlpha = clamp(f.a, 0, 0.7);
+      X.fillStyle   = 'rgba(255,255,255,1)';
+      X.shadowColor = 'rgba(255,200,200,0.8)';
+      X.shadowBlur  = 18;
+      X.beginPath();
+      X.arc(f.x, f.y, Math.max(1, f.r), 0, Math.PI * 2);
+      X.fill();
+      X.restore();
+    }
+  }
+
+  /* ── HUD ── */
+  function drawHUD() {
+    X.save();
+    X.font      = '600 22px Orbitron, monospace';
+    X.textAlign = 'center';
+    X.textBaseline = 'top';
+    X.fillStyle = 'rgba(255,255,255,0.88)';
+    X.shadowColor = 'rgba(90,160,255,0.45)';
+    X.shadowBlur  = 8;
+    X.fillText(fmt(time), W / 2, 8);
+
+    if (best > 0) {
+      X.font      = '300 11px Inter, sans-serif';
+      X.fillStyle = 'rgba(255,255,255,0.3)';
+      X.shadowBlur = 0;
+      X.fillText(`BEST  ${fmt(best)}`, W / 2, 35);
+    }
+    X.restore();
+  }
+
+  /* ── best-score badge (prominent, glowing) ── */
+  function drawBestBadge(cx, cy) {
+    if (best <= 0) return;
+
+    const badgeW = 230, badgeH = 56, rad = 12;
+    const bx = cx - badgeW / 2, by = cy - badgeH / 2;
+
+    /* glowing border */
+    X.save();
+    X.shadowColor = 'rgba(255,215,64,0.55)';
+    X.shadowBlur  = 18;
+    X.strokeStyle = 'rgba(255,215,64,0.5)';
+    X.lineWidth   = 1.6;
+    roundRect(bx, by, badgeW, badgeH, rad);
+    X.stroke();
+
+    /* frosted bg */
+    X.shadowBlur  = 0;
+    X.fillStyle   = 'rgba(255,215,64,0.06)';
+    roundRect(bx, by, badgeW, badgeH, rad);
+    X.fill();
+
+    /* trophy icon */
+    X.font      = '22px serif';
+    X.textAlign = 'center';
+    X.textBaseline = 'middle';
+    X.fillStyle = '#ffd740';
+    X.fillText('🏆', bx + 28, cy + 1);
+
+    /* label */
+    X.font      = '300 11px Inter, sans-serif';
+    X.fillStyle = 'rgba(255,215,64,0.55)';
+    X.textAlign = 'left';
+    X.fillText('PERSONAL BEST', bx + 52, cy - 10);
+
+    /* time */
+    X.font      = '600 20px Orbitron, monospace';
+    X.fillStyle = '#ffd740';
+    X.shadowColor = 'rgba(255,215,64,0.35)';
+    X.shadowBlur  = 8;
+    X.fillText(fmt(best), bx + 52, cy + 12);
+
+    X.restore();
+  }
+
+  /* ── How-to-Play button (used on title & game-over) ── */
+  function drawHelpButton(cx, cy) {
+    const btnW = 180, btnH = 40, rad = 8;
+    const bx = cx - btnW / 2, by = cy - btnH / 2;
+    helpBtn = { x: bx, y: by, w: btnW, h: btnH };
+
+    X.save();
+    X.fillStyle   = 'rgba(255,255,255,0.04)';
+    X.strokeStyle = 'rgba(180,200,255,0.35)';
+    X.lineWidth   = 1.2;
+    roundRect(bx, by, btnW, btnH, rad);
+    X.fill(); X.stroke();
+
+    X.font      = '500 14px Inter, sans-serif';
+    X.textAlign = 'center';
+    X.textBaseline = 'middle';
+    X.fillStyle = 'rgba(180,210,255,0.75)';
+    X.fillText('❓  How to Play', cx, cy);
+    X.restore();
+  }
+
+  /* ── Instruction popup overlay ── */
+  function drawHelpPopup() {
+    X.save();
+    X.fillStyle = 'rgba(2,2,10,0.88)';
+    X.fillRect(0, 0, W, H);
+
+    const popW = Math.min(540, W - 60);
+    const popH = Math.min(430, H - 60);
+    const px = (W - popW) / 2, py = (H - popH) / 2;
+
+    /* panel bg */
+    X.fillStyle   = 'rgba(12,14,32,0.97)';
+    X.strokeStyle = 'rgba(80,120,255,0.30)';
+    X.lineWidth   = 1.5;
+    X.shadowColor = 'rgba(60,100,255,0.25)';
+    X.shadowBlur  = 30;
+    roundRect(px, py, popW, popH, 16);
+    X.fill(); X.stroke();
+    X.shadowBlur = 0;
+
+    /* heading */
+    X.textAlign    = 'center';
+    X.textBaseline = 'middle';
+    X.font        = '800 ' + Math.min(26, popW * 0.05) + 'px Orbitron, monospace';
+    X.fillStyle   = '#ffd740';
+    X.shadowColor = 'rgba(255,215,64,0.3)';
+    X.shadowBlur  = 12;
+    X.fillText('HOW TO PLAY', W / 2, py + 40);
+    X.shadowBlur = 0;
+
+    /* instruction cards */
+    const cards = [
+      { icon: '⭐', title: 'Protect the Star',     desc: 'A wandering star roams the arena — keep it alive at all costs.' },
+      { icon: '🔴', title: 'Enemies Incoming',     desc: 'Red circles spawn from the edges and relentlessly chase the star.' },
+      { icon: '🟦', title: 'Click to Attack',      desc: 'Click an enemy to send your square dashing through it, destroying it.' },
+      { icon: '⚡', title: 'One at a Time',         desc: 'Each dash locks input until complete — plan your clicks wisely.' },
+      { icon: '🎯', title: 'Prioritise Threats',   desc: 'If any enemy touches the star it\'s game over — target the closest first.' },
+      { icon: '📈', title: 'Rising Difficulty',     desc: 'Enemies get faster and more numerous over time. How long can you last?' }
+    ];
+
+    const cardH = 42;
+    const cardGap = 6;
+    const startY = py + 72;
+    const cardW = popW - 48;
+    const cardX = px + 24;
+
+    cards.forEach((c, i) => {
+      const cy = startY + i * (cardH + cardGap);
+
+      /* card bg */
+      X.fillStyle = 'rgba(255,255,255,0.025)';
+      roundRect(cardX, cy, cardW, cardH, 8);
+      X.fill();
+
+      /* left accent bar */
+      X.fillStyle = 'rgba(80,140,255,0.25)';
+      roundRect(cardX, cy, 4, cardH, 2);
+      X.fill();
+
+      /* icon */
+      X.font      = '16px serif';
+      X.textAlign = 'left';
+      X.textBaseline = 'middle';
+      X.fillStyle = 'rgba(255,255,255,0.7)';
+      X.fillText(c.icon, cardX + 14, cy + cardH / 2);
+
+      /* title */
+      X.font      = '600 13px Inter, sans-serif';
+      X.fillStyle = 'rgba(255,255,255,0.88)';
+      X.fillText(c.title, cardX + 40, cy + cardH / 2 - 8);
+
+      /* desc */
+      X.font      = '300 11px Inter, sans-serif';
+      X.fillStyle = 'rgba(200,210,240,0.50)';
+      X.fillText(c.desc, cardX + 40, cy + cardH / 2 + 10);
+    });
+
+    /* close button */
+    const closeBW = 120, closeBH = 38, closeRad = 8;
+    const closeBX = W / 2 - closeBW / 2;
+    const closeBY = py + popH - 58;
+    helpCloseBtn = { x: closeBX, y: closeBY, w: closeBW, h: closeBH };
+
+    X.fillStyle   = 'rgba(255,255,255,0.04)';
+    X.strokeStyle = '#00d4ff';
+    X.lineWidth   = 1.3;
+    roundRect(closeBX, closeBY, closeBW, closeBH, closeRad);
+    X.fill(); X.stroke();
+
+    X.font      = '600 14px Inter, sans-serif';
+    X.textAlign = 'center';
+    X.fillStyle = '#00d4ff';
+    X.fillText('Got it', W / 2, closeBY + closeBH / 2);
+
+    X.restore();
+  }
+
+  /* ── title ── */
+  function drawTitle(dt) {
+    titlePulse += dt * 2.5;
+
+    drawArena();
+
+    /* animated background dots */
+    X.save();
+    const t = titlePulse;
+    for (let i = 0; i < 40; i++) {
+      const bx = arena.x + ((i * 137.5 + t * 18) % arena.w);
+      const by = arena.y + ((i * 97.3 + Math.sin(t + i) * 30 + arena.h) % arena.h);
+      X.globalAlpha = 0.06 + Math.sin(t + i * 0.7) * 0.03;
+      X.fillStyle = i % 3 === 0 ? '#ffd740' : '#00d4ff';
+      X.beginPath(); X.arc(bx, by, 2, 0, Math.PI * 2); X.fill();
+    }
+    X.restore();
+
+    X.save();
+    X.textAlign    = 'center';
+    X.textBaseline = 'middle';
+
+    /* main title */
+    X.font = '900 ' + Math.min(56, W * 0.04) + 'px Orbitron, monospace';
+    X.fillStyle   = '#ffd740';
+    X.shadowColor = 'rgba(255,215,64,0.55)';
+    X.shadowBlur  = 30;
+    X.fillText('STAR GUARDIAN', W / 2, H / 2 - 90);
+
+    /* tagline */
+    X.shadowBlur = 0;
+    X.font      = '300 ' + Math.min(15, W * 0.012) + 'px Inter, sans-serif';
+    X.fillStyle = 'rgba(255,255,255,0.42)';
+    X.fillText('Reaction-based survival  •  Protect the star at all costs', W / 2, H / 2 - 48);
+
+    X.restore();
+
+    /* best score badge */
+    drawBestBadge(W / 2, H / 2 + 4);
+
+    /* how to play button */
+    drawHelpButton(W / 2, H / 2 + (best > 0 ? 62 : 30));
+
+    /* start prompt */
+    X.save();
+    X.textAlign = 'center'; X.textBaseline = 'middle';
+    const blink = (Math.sin(titlePulse * 2) + 1) / 2;
+    X.font      = '600 ' + Math.min(18, W * 0.014) + 'px Inter, sans-serif';
+    X.fillStyle = `rgba(80,200,255,${0.38 + blink * 0.52})`;
+    X.fillText('Click anywhere to start', W / 2, H / 2 + (best > 0 ? 112 : 80));
+    X.restore();
+
+    /* help popup on top */
+    if (showHelp) drawHelpPopup();
+  }
+
+  /* ── game over ── */
+  function drawGameOver(dt) {
+    /* red flash */
+    if (gameOverFlash > 0) {
+      X.save();
+      X.globalAlpha = clamp(gameOverFlash, 0, 0.35);
+      X.fillStyle   = '#e63946';
+      X.fillRect(0, 0, W, H);
+      X.restore();
+      gameOverFlash -= dt * 3;
+    }
+
+    /* dark overlay */
+    X.save();
+    X.fillStyle = 'rgba(4,4,12,0.80)';
+    X.fillRect(0, 0, W, H);
+
+    X.textAlign    = 'center';
+    X.textBaseline = 'middle';
+
+    /* GAME OVER */
+    X.font        = '900 ' + Math.min(50, W * 0.038) + 'px Orbitron, monospace';
+    X.fillStyle   = '#e63946';
+    X.shadowColor = 'rgba(230,50,60,0.5)';
+    X.shadowBlur  = 28;
+    X.fillText('GAME OVER', W / 2, H / 2 - 120);
+
+    /* label */
+    X.shadowBlur = 0;
+    X.font      = '300 13px Inter, sans-serif';
+    X.fillStyle = 'rgba(255,255,255,0.38)';
+    X.fillText('SURVIVAL TIME', W / 2, H / 2 - 76);
+
+    /* time */
+    X.font        = '600 38px Orbitron, monospace';
+    X.fillStyle   = '#ffd740';
+    X.shadowColor = 'rgba(255,215,64,0.4)';
+    X.shadowBlur  = 14;
+    X.fillText(fmt(time), W / 2, H / 2 - 46);
+    X.shadowBlur = 0;
+
+    /* new best callout */
+    if (best > 0 && time >= best) {
+      X.font      = '600 16px Orbitron, monospace';
+      X.fillStyle = '#00d4ff';
+      X.shadowColor = 'rgba(0,212,255,0.4)';
+      X.shadowBlur  = 10;
+      X.fillText('★  NEW PERSONAL BEST  ★', W / 2, H / 2 - 8);
+      X.shadowBlur = 0;
+    }
+
+    X.restore();
+
+    /* best badge */
+    drawBestBadge(W / 2, H / 2 + 42);
+
+    /* how to play button */
+    drawHelpButton(W / 2, H / 2 + (best > 0 ? 100 : 80));
+
+    /* restart prompt */
+    X.save();
+    X.textAlign = 'center'; X.textBaseline = 'middle';
+    const blink = (Math.sin(Date.now() / 400) + 1) / 2;
+    X.font      = '600 ' + Math.min(18, W * 0.014) + 'px Inter, sans-serif';
+    X.fillStyle = `rgba(80,200,255,${0.38 + blink * 0.55})`;
+    X.fillText('Click anywhere to restart', W / 2, H / 2 + (best > 0 ? 146 : 126));
+    X.restore();
+
+    /* help popup on top */
+    if (showHelp) drawHelpPopup();
+  }
+
+  /* ── pause icon (top-right, drawn during play) ── */
+  function drawPauseIcon() {
+    const bx = W - PAUSE_BTN_PAD - PAUSE_BTN_SIZE;
+    const by = PAUSE_BTN_PAD;
+
+    X.save();
+    X.globalAlpha = 0.35;
+    X.fillStyle = 'rgba(255,255,255,0.9)';
+    const barW = 5, barH = 18, gap = 6;
+    const cx = bx + PAUSE_BTN_SIZE / 2;
+    const cy = by + PAUSE_BTN_SIZE / 2;
+    X.fillRect(cx - gap / 2 - barW, cy - barH / 2, barW, barH);
+    X.fillRect(cx + gap / 2,        cy - barH / 2, barW, barH);
+    X.restore();
+  }
+
+  /* ── pause overlay ── */
+  function drawPause() {
+    X.save();
+    X.fillStyle = 'rgba(4,4,14,0.82)';
+    X.fillRect(0, 0, W, H);
+
+    X.textAlign    = 'center';
+    X.textBaseline = 'middle';
+
+    /* heading */
+    X.font        = '800 ' + Math.min(44, W * 0.034) + 'px Orbitron, monospace';
+    X.fillStyle   = 'rgba(255,255,255,0.85)';
+    X.shadowColor = 'rgba(90,160,255,0.4)';
+    X.shadowBlur  = 22;
+    X.fillText('PAUSED', W / 2, H / 2 - 110);
+    X.shadowBlur  = 0;
+
+    /* timer context */
+    X.font      = '300 13px Inter, sans-serif';
+    X.fillStyle = 'rgba(255,255,255,0.3)';
+    X.fillText(`Time: ${fmt(time)}`, W / 2, H / 2 - 72);
+
+    /* ── menu buttons ── */
+    const btnW = 200, btnH = 44, gap = 16;
+    const startY = H / 2 - 32;
+    const labels = [
+      { key: 'resume',  text: 'Resume',  color: '#00d4ff' },
+      { key: 'restart', text: 'Restart', color: '#ffd740' },
+      { key: 'quit',    text: 'Quit',    color: '#e63946' }
+    ];
+
+    labels.forEach((btn, i) => {
+      const bx = W / 2 - btnW / 2;
+      const by = startY + i * (btnH + gap);
+      pauseBtns[btn.key] = { x: bx, y: by, w: btnW, h: btnH };
+
+      /* button bg */
+      X.fillStyle   = 'rgba(255,255,255,0.04)';
+      X.strokeStyle = btn.color;
+      X.lineWidth   = 1.4;
+      roundRect(bx, by, btnW, btnH, 8);
+      X.fill();
+      X.stroke();
+
+      /* label */
+      X.font      = '600 16px Inter, sans-serif';
+      X.fillStyle = btn.color;
+      X.fillText(btn.text, W / 2, by + btnH / 2);
+    });
+
+    /* hint */
+    X.font      = '300 12px Inter, sans-serif';
+    X.fillStyle = 'rgba(255,255,255,0.22)';
+    X.fillText('Press  ESC  to resume', W / 2, startY + labels.length * (btnH + gap) + 20);
+
+    X.restore();
+  }
+
+  /* rounded-rect helper */
+  function roundRect(x, y, w, h, r) {
+    X.beginPath();
+    X.moveTo(x + r, y);
+    X.lineTo(x + w - r, y);
+    X.quadraticCurveTo(x + w, y, x + w, y + r);
+    X.lineTo(x + w, y + h - r);
+    X.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+    X.lineTo(x + r, y + h);
+    X.quadraticCurveTo(x, y + h, x, y + h - r);
+    X.lineTo(x, y + r);
+    X.quadraticCurveTo(x, y, x + r, y);
+    X.closePath();
+  }
+
+  /* ── main draw ── */
+  function draw(dt) {
+    X.clearRect(0, 0, W, H);
+    X.fillStyle = '#04040c';
+    X.fillRect(0, 0, W, H);
+
+    if (phase === 'title') { drawTitle(dt); return; }
+
+    /* draw the game world for play, pause, and over states */
+    X.save();
+    X.translate(Math.round(shakeX), Math.round(shakeY));
+
+    drawArena();
+    drawTrail();
+    drawEnemies();
+    drawStar();
+    drawSquare();
+    drawFX();
+    drawHUD();
+    if (phase === 'play') drawPauseIcon();
+
+    X.restore();
+
+    if (phase === 'pause') drawPause();
+    if (phase === 'over')  drawGameOver(dt);
+  }
+
+  /* ================================================================
+     LOOP
+     ================================================================ */
+  function loop(ts) {
+    if (!prevTS) prevTS = ts;
+    const dt = Math.min((ts - prevTS) / 1000, 0.05);
+    prevTS = ts;
+    update(dt);
+    draw(dt);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
